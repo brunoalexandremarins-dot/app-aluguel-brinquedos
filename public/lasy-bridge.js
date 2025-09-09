@@ -8,15 +8,19 @@
 
   const TARGET_ORIGIN = '*'; // Será validado no parent
   let logCounter = 0;
+  let bridgeInitialized = false;
 
-  // Health check - notificar que bridge está pronto
-  try {
-    window.parent?.postMessage({ 
-      __lasy: true, 
-      type: 'lasy-bridge-ready' 
-    }, TARGET_ORIGIN);
-  } catch (error) {
-    console.debug('Lasy bridge ready signal failed:', error);
+  // Função para notificar que bridge está pronto
+  function notifyBridgeReady() {
+    try {
+      window.parent?.postMessage({ 
+        __lasy: true, 
+        type: 'lasy-bridge-ready' 
+      }, TARGET_ORIGIN);
+      console.debug('[Lasy Bridge] Ready signal sent to parent');
+    } catch (error) {
+      console.debug('Lasy bridge ready signal failed:', error);
+    }
   }
 
   const publish = (evt) => {
@@ -56,7 +60,23 @@
   // 1. CAPTURAR ERROS EXISTENTES
   function captureExistingErrors() {
     try {
-      // Capturar erro atual do Next.js
+      // ✅ NOVO: Detectar página de erro "Sandbox Not Found" (E2B 502)
+      if (document.title === 'Sandbox Not Found' || 
+          document.body.innerHTML.includes("wasn't found") ||
+          (document.body.innerHTML.includes("The sandbox") && document.body.innerHTML.includes("wasn't found"))) {
+        publish({
+          source: 'sandbox-status',
+          level: 'error',
+          message: 'Sandbox not found - E2B returned 502',
+          args: ['Sandbox expired or not found'],
+          type: 'sandbox-not-found',
+          errorSource: 'e2b-502'
+        });
+        console.warn('[Lasy Bridge] Sandbox 502 detected');
+        return; // Não processar outros erros se sandbox expirou
+      }
+      
+      // Capturar erro atual do Next.js (apenas se não for problema de sandbox)
       const nextData = window.__NEXT_DATA__;
       if (nextData?.err) {
         publish({
@@ -105,43 +125,49 @@
           });
         }
       }
-    } catch (error) {
-      // Falha silenciosa
-    }
-  }
-
-  // 2. CHAIN com console.* existentes
-  ['log', 'info', 'warn', 'error'].forEach((level) => {
-    const existingFunction = console[level];
-    
-    console[level] = (...args) => {
-      // Evitar capturar nossos próprios logs ou logs internos
-      const firstArg = args.length > 0 ? String(args[0]) : '';
-      if (firstArg.includes('Lasy bridge') || 
-          firstArg.includes('HMR') ||
-          firstArg.includes('[Fast Refresh]') ||
-          firstArg.includes('webpack')) {
-        return existingFunction.apply(console, args);
-      }
-      
-      // Nossa captura primeiro
-      try {
-        publish({
-          source: 'client-console',
-          level: level,
-          args: args,
-          message: args.map(arg => String(arg)).join(' '),
-          type: 'console-call',
-          interceptedBy: 'lasy-chain'
-        });
-      } catch (error) {
+          } catch {
         // Falha silenciosa
       }
+  }
+
+  // 2. CHAIN com console.* existentes (aguardar hidratação)
+  function setupConsoleInterception() {
+    ['log', 'info', 'warn', 'error'].forEach((level) => {
+      const existingFunction = console[level];
       
-      // Executar função existente
-      return existingFunction.apply(console, args);
-    };
-  });
+      console[level] = (...args) => {
+        // Evitar capturar nossos próprios logs ou logs internos
+        const firstArg = args.length > 0 ? String(args[0]) : '';
+        if (firstArg.includes('Lasy bridge') || 
+            firstArg.includes('Lasy Bridge') ||
+            firstArg.includes('HMR') ||
+            firstArg.includes('[Fast Refresh]') ||
+            firstArg.includes('webpack') ||
+            firstArg.includes('[Lasy')) {
+          return existingFunction.apply(console, args);
+        }
+        
+        // Nossa captura primeiro (apenas se bridge inicializado)
+        if (bridgeInitialized) {
+          try {
+            publish({
+              source: 'client-console',
+              level: level,
+              args: args,
+              message: args.map(arg => String(arg)).join(' '),
+              type: 'console-call',
+              interceptedBy: 'lasy-chain'
+            });
+                } catch {
+        // Falha silenciosa
+      }
+        }
+        
+        // Executar função existente
+        return existingFunction.apply(console, args);
+      };
+    });
+  }
 
   // 3. CHAIN com window.onerror
   const existingWindowOnError = window.onerror;
@@ -159,7 +185,7 @@
         type: 'window-onerror',
         interceptedBy: 'lasy-chain'
       });
-    } catch (err) {
+    } catch {
       // Falha silenciosa
     }
     
@@ -184,7 +210,7 @@
         type: 'javascript-error',
         interceptedBy: 'lasy-chain'
       });
-    } catch (err) {
+    } catch {
       // Falha silenciosa
     }
   });
@@ -204,7 +230,7 @@
         type: 'promise-rejection',
         interceptedBy: 'lasy-chain'
       });
-    } catch (err) {
+    } catch {
       // Falha silenciosa
     }
     
@@ -226,7 +252,7 @@
         type: 'promise-rejection-listener',
         interceptedBy: 'lasy-chain'
       });
-    } catch (err) {
+    } catch {
       // Falha silenciosa
     }
   });
@@ -311,19 +337,51 @@
     return xhr;
   };
 
-  // 9. Executar captura de erros existentes
-  setTimeout(() => {
+  // 9. Função principal de inicialização
+  function initializeLasyBridge() {
+    console.debug('[Lasy Bridge] Starting initialization...');
+    
+    // 1. Capturar erros existentes primeiro
     captureExistingErrors();
-  }, 100);
+    
+    // 2. Configurar interceptação de console
+    setupConsoleInterception();
+    
+    // 3. Marcar como inicializado
+    bridgeInitialized = true;
+    
+    // 4. Notificar que a ponte foi estabelecida
+    publish({
+      source: 'client-bridge',
+      level: 'info',
+      message: 'Lasy console logs conectado',
+      args: ['Lasy console logs conectado'],
+      type: 'bridge-initialized'
+    });
+    
+    // 5. Enviar sinal de pronto para parent
+    notifyBridgeReady();
+    
+    // 6. Enviar sinal adicional com delay para garantir que parent esteja escutando
+    setTimeout(() => {
+      console.log('[Lasy Bridge] Sending delayed ready signal...');
+      notifyBridgeReady();
+    }, 1000);
+    
+    console.debug('[Lasy Bridge] Initialization completed');
+  }
 
-  // Notificar que a ponte foi estabelecida
-  publish({
-    source: 'client-bridge',
-    level: 'info',
-    message: 'Lasy console logs conectado',
-    args: ['Lasy console logs conectado'],
-    type: 'bridge-initialized'
-  });
+  // Aguardar hidratação antes de inicializar
+  if (document.readyState === 'loading') {
+    // Aguardar DOM estar pronto
+    document.addEventListener('DOMContentLoaded', () => {
+      // Aguardar um pouco mais para garantir hidratação
+      setTimeout(initializeLasyBridge, 250);
+    });
+  } else {
+    // DOM já está pronto, aguardar um pouco para hidratação
+    setTimeout(initializeLasyBridge, 100);
+  }
 
   // ===== ELEMENT SELECTOR FUNCTIONALITY =====
   let elementSelectorActive = false;
@@ -363,10 +421,27 @@
     return tag;
   }
 
-  // Ativar seletor de elementos
+  // Ativar seletor de elementos (com verificações de segurança)
   function activateElementSelector() {
+    console.log('[Lasy Element Selector] activateElementSelector() called');
+    console.log('[Lasy Element Selector] Current state - elementSelectorActive:', elementSelectorActive, 'bridgeInitialized:', bridgeInitialized, 'document.readyState:', document.readyState);
+    
     if (elementSelectorActive) {
       console.log('[Lasy Element Selector] Already active');
+      return;
+    }
+    
+    // Verificação básica de DOM - mais permissiva
+    if (document.readyState === 'loading') {
+      console.log('[Lasy Element Selector] Waiting for DOM to be ready...');
+      setTimeout(activateElementSelector, 300);
+      return;
+    }
+    
+    // Verificação adicional de segurança - se bridge ainda não inicializou, aguardar mais um pouco
+    if (!bridgeInitialized) {
+      console.log('[Lasy Element Selector] Bridge not ready, waiting...');
+      setTimeout(activateElementSelector, 200);
       return;
     }
     
@@ -512,13 +587,29 @@
 
   // Escutar comandos de ativação/desativação do parent
   window.addEventListener('message', (event) => {
+    console.log('[Lasy Element Selector] Received message:', event.data.type, event.data);
+    
     if (event.data.type === 'lasy-element-selector') {
       const action = event.data.action;
+      console.log('[Lasy Element Selector] Processing action:', action);
+      
       if (action === 'activate') {
-        activateElementSelector();
+        console.log('[Lasy Element Selector] Scheduling activation with 500ms delay...');
+        // Delay para garantir hidratação completa - usuário já viu a página funcionando
+        setTimeout(() => {
+          console.log('[Lasy Element Selector] Executing delayed activation...');
+          activateElementSelector();
+        }, 500);
       } else if (action === 'deactivate') {
+        console.log('[Lasy Element Selector] Deactivating immediately...');
         deactivateElementSelector();
       }
+    }
+    
+    // Responder a pedidos de status do bridge
+    if (event.data.type === 'lasy-bridge-status-request') {
+      console.log('[Lasy Bridge] Status requested, sending ready signal...');
+      notifyBridgeReady();
     }
   });
 
@@ -641,12 +732,20 @@
     });
   }
 
-  // Scan inicial e notificação de URL atual
-  setTimeout(() => {
+  // Função para inicializar URL tracking (aguardar bridge estar pronto)
+  function initializeUrlTracking() {
+    if (!bridgeInitialized) {
+      setTimeout(initializeUrlTracking, 100);
+      return;
+    }
+    
     notifyUrlChange(); // Notificar URL inicial
     scanPageLinks(); // Scan inicial de links
     console.log('[Lasy URL Tracker] Initialized and tracking URL changes');
     console.log('[Lasy Route Discovery] Initialized and scanning for routes');
-  }, 1000); // Aguardar carregamento completo da página
+  }
+
+  // Aguardar carregamento completo da página
+  setTimeout(initializeUrlTracking, 1000);
 
 })();
